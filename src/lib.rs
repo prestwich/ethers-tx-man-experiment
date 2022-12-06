@@ -1,4 +1,4 @@
-use std::{fmt::Display, future::Future, pin::Pin, task::Poll, time::Duration};
+use std::{fmt::Display, future::Future, pin::Pin, task::Poll};
 
 use ethers::{
     prelude::{signer::SignerMiddlewareError, SignerMiddleware},
@@ -10,7 +10,6 @@ use ethers::{
     },
 };
 use futures::StreamExt;
-use tokio::select;
 
 /// too lazy to write "pin box fut" over and over
 type Pbf<'a, M, T> = Pin<Box<dyn Future<Output = Result<T, <M as Middleware>::Error>> + 'a>>;
