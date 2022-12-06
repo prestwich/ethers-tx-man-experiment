@@ -231,52 +231,6 @@ where
     }
 }
 
-impl<'a, M> TxMan<'a, M>
-where
-    M: Middleware,
-{
-    pub async fn spawn(self) -> Result<Option<TransactionReceipt>, M::Error> {
-        // set up the initial pending
-        let pending = PendingTransaction::new(self.hash, self.provider.provider());
-        tokio::pin!(pending);
-
-        loop {
-            if let Ok(None) = self.provider.get_transaction(self.hash).await {
-                *pending = self
-                    .provider
-                    .send_raw_transaction(self.serialized_tx.clone())
-                    .await?;
-            }
-
-            select! {
-                _ = tokio::time::sleep(Duration::from_secs(60)) => {}
-                res = &mut pending => {
-                    match res {
-                        Ok(None) => {
-                            // indicates we believe it dropped.
-                            // This will be addressed at top of loop
-                            // no action needed here
-                         }
-                         Ok(Some(receipt)) => {
-                            return Ok(Some(receipt))
-                         }
-                         Err(e) => {
-                            return Err(M::convert_err(e))
-                         }
-                    }
-                 }
-            }
-            let nonce = self
-                .provider
-                .get_transaction_count(self.sender, None)
-                .await?;
-            if nonce >= self.nonce {
-                return Ok(None);
-            }
-        }
-    }
-}
-
 /// Desires: resilient to mempool drops & to other txns at the same nonce
 ///
 /// Data:
