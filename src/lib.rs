@@ -1,4 +1,12 @@
-use std::{fmt::Display, future::Future, pin::Pin, task::Poll};
+//! Experimental Tx re-broadcaster for ethers-rs txns
+
+use std::{
+    fmt::{Debug, Display},
+    future::Future,
+    pin::Pin,
+    task::Poll,
+    time::Duration,
+};
 
 use ethers::{
     prelude::{signer::SignerMiddlewareError, SignerMiddleware},
@@ -28,7 +36,7 @@ type Pbf<'a, M, T> = Pin<Box<dyn Future<Output = Result<T, <M as Middleware>::Er
 ///
 /// Polling for the nonce increase happens approximately every block
 #[pin_project::pin_project]
-#[must_use = "Futures do nothing unless cloned"]
+#[must_use = "Futures do nothing unless polled"]
 pub struct TxMan<'a, M>
 where
     M: Middleware,
@@ -49,7 +57,7 @@ where
     blocks: FilterWatcher<'a, M::Provider, H256>,
 }
 
-impl<'a, M> std::fmt::Debug for TxMan<'a, M>
+impl<'a, M> Debug for TxMan<'a, M>
 where
     M: Middleware,
 {
@@ -61,7 +69,17 @@ where
             .field("nonce", &self.nonce)
             .field("hash", &self.hash)
             .field("state", &self.state)
+            // skip the blocks stream
             .finish()
+    }
+}
+
+impl<M> Display for TxMan<'_, M>
+where
+    M: Middleware,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Tx for {:?}", self.hash)
     }
 }
 
@@ -78,6 +96,7 @@ where
     ) -> Result<TxMan<'a, M>, M::Error> {
         let mut t = tx.clone();
         provider.fill_transaction(&mut t, None).await?;
+
         let nonce = *tx.nonce().expect("to be filled just above");
         let hash = tx.hash(sig);
         let serialized_tx = tx.rlp_signed(sig);
@@ -131,7 +150,7 @@ where
     Complete,
 }
 
-impl<'a, M> std::fmt::Debug for ManStates<'a, M>
+impl<'a, M> Debug for ManStates<'a, M>
 where
     M: Middleware,
 {
@@ -159,9 +178,9 @@ where
             // after broadcast we go into waiting for receipt.
             ManStates::InitialBroadcast(fut) | ManStates::Rebroadcasting(fut) => {
                 match futures::ready!(fut.as_mut().poll(cx)) {
-                    // we don't actually want the pending transaction. we just
-                    // want to go to receipt polling
                     Ok(pending) => {
+                        // we set this low so that the delay is low
+                        let pending = pending.interval(Duration::from_secs(1));
                         *this.state = ManStates::WaitingForReceipt(Box::pin(pending));
                         cx.waker().wake_by_ref();
                         Poll::Pending
@@ -176,7 +195,6 @@ where
             // our waiting either resolves to timeout or to receipt
             ManStates::WaitingForReceipt(pending) => {
                 match (this.blocks.poll_next_unpin(cx), pending.as_mut().poll(cx)) {
-                    // pending resolved, regardless of sleep
                     (_, Poll::Ready(res)) => match res {
                         Ok(Some(receipt)) => Poll::Ready(Ok(Some(receipt))),
                         // No receipt
@@ -194,7 +212,6 @@ where
                             Poll::Ready(Err(M::convert_err(e)))
                         }
                     },
-                    // pending NOT resolved, sleep has
                     (Poll::Ready(_), _) => {
                         *this.state = ManStates::GettingNonce(Box::pin(
                             this.provider.get_transaction_count(*this.sender, None),
@@ -227,34 +244,5 @@ where
             },
             ManStates::Complete => panic!("polled after completion"),
         }
-    }
-}
-
-/// Desires: resilient to mempool drops & to other txns at the same nonce
-///
-/// Data:
-///
-/// - Hold the serialized txn & its nonce
-/// - Hold a provider
-/// - Hold a `PendingTransaction` future
-///
-/// Behavior:
-///
-/// - select across pending and an `eth_getTransactionCount` call
-/// - if the pending resolves to `Ok(None)`, rebraodcast it
-/// - if the pending resolves to `Err(_)`, see if it's in the mempool
-///   - if so, start a new pending it
-///   - if not, rebroadcast it
-/// - every 30 seconds poll the account nonce via `getTransactionCount`
-///   - if >= tx nonce, end with `Ok(None)`
-///      - (document that this indicates another tx confirmed at same nonce)
-///   - else, continue waiting on the pending tx
-
-impl<M> Display for TxMan<'_, M>
-where
-    M: Middleware,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Tx for {:?}", self.hash)
     }
 }
