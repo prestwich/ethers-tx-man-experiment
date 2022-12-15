@@ -27,7 +27,7 @@ type Pbf<'a, M, T> = Pin<Box<dyn Future<Output = Result<T, <M as Middleware>::Er
 ///
 /// As a future, it will resolve to either
 /// - An error from the underlying middleware
-/// - Ok(Some(receipt)) - when this TX has confirmed and the receipt is available
+/// - Ok(Some(receipt)) - when ANY tx
 ///
 /// If the transaction appears to have been dropped from the mempool, this
 /// future will rebroadcast it. This will repeat until either the tx is
@@ -146,7 +146,7 @@ where
 {
     InitialBroadcast(Pbf<'a, M, PendingTransaction<'a, M::Provider>>),
     Rebroadcasting(Pbf<'a, M, PendingTransaction<'a, M::Provider>>),
-    WaitingForReceipt(Pin<Box<PendingTransaction<'a, M::Provider>>>),
+    WaitingForPending(Pin<Box<PendingTransaction<'a, M::Provider>>>),
     GettingNonce {
         head: Pbf<'a, M, U64>,
         nonce: Pbf<'a, M, U256>,
@@ -175,7 +175,7 @@ where
         match self {
             Self::InitialBroadcast(_) => write!(f, "InitialBroadcast"),
             Self::Rebroadcasting(_) => write!(f, "Rebroadcasting"),
-            Self::WaitingForReceipt(_) => write!(f, "WaitingForReceipt"),
+            Self::WaitingForPending(_) => write!(f, "WaitingForReceipt"),
             Self::FetchingReceipt { .. } => write!(f, "FetchingReceipt"),
             Self::GettingNonce { .. } => write!(f, "GettingNonce"),
             Self::Seeking { .. } => write!(f, "Seeking"),
@@ -203,7 +203,7 @@ where
                     Ok(pending) => {
                         // we set this low so that the delay is low
                         let pending = pending.interval(Duration::from_secs(1));
-                        *this.state = ManStates::WaitingForReceipt(Box::pin(pending));
+                        *this.state = ManStates::WaitingForPending(Box::pin(pending));
                         cx.waker().wake_by_ref();
                         Poll::Pending
                     }
@@ -215,7 +215,7 @@ where
                 }
             }
             // our waiting either resolves to timeout or to receipt
-            ManStates::WaitingForReceipt(pending) => {
+            ManStates::WaitingForPending(pending) => {
                 match (this.blocks.poll_next_unpin(cx), pending.as_mut().poll(cx)) {
                     (_, Poll::Ready(res)) => match res {
                         Ok(Some(receipt)) => Poll::Ready(Ok(receipt)),
@@ -286,6 +286,7 @@ where
                     *this.state = ManStates::Complete;
                     Poll::Ready(Err(e))
                 }
+                // no block
                 Poll::Ready(Ok(None)) => {
                     *this.state = ManStates::Delaying {
                         delay: Box::pin(tokio::time::sleep(Duration::from_secs(2))),
@@ -299,8 +300,10 @@ where
                     cx.waker().wake_by_ref();
                     Poll::Pending
                 }
+                // block
                 Poll::Ready(Ok(Some(block))) => {
                     if let Some(tx) = block.transactions.iter().find(|tx| tx.nonce == *this.nonce) {
+                        // getting receipt
                         *this.state = ManStates::FetchingReceipt {
                             tx_hash: tx.hash,
                             receipt: this.provider.get_transaction_receipt(tx.hash),
@@ -308,12 +311,25 @@ where
                         cx.waker().wake_by_ref();
                         Poll::Pending
                     } else {
-                        let height = *height - 1;
-                        *this.state = ManStates::Seeking {
-                            lower_bound: *lower_bound,
-                            height,
-                            block: Box::pin(this.provider.get_block_with_txs(height)),
-                        };
+                        if height < lower_bound {
+                            let height = *lower_bound + 20;
+                            *this.state = ManStates::Delaying {
+                                delay: Box::pin(tokio::time::sleep(Duration::from_secs(2))),
+                                next_state: Box::new(Some(ManStates::Seeking {
+                                    lower_bound: *lower_bound,
+                                    height,
+                                    block: this.provider.get_block_with_txs(height),
+                                })),
+                            }
+                        } else {
+                            let height = *height - 1;
+                            *this.state = ManStates::Seeking {
+                                lower_bound: *lower_bound,
+                                height,
+                                block: Box::pin(this.provider.get_block_with_txs(height)),
+                            };
+                        }
+                        cx.waker().wake_by_ref();
                         Poll::Pending
                     }
                 }
